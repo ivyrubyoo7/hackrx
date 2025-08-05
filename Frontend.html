@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HackRx LLM API Client</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f7f9; color: #333; }
+    .container { max-width: 900px; margin: auto; padding: 25px; border-radius: 12px; background-color: #fff; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+    h1, h2 { text-align: center; color: #2c3e50; }
+    .section { margin-bottom: 30px; border-bottom: 1px solid #e0e6e8; padding-bottom: 20px; }
+    .form-group { margin-bottom: 15px; }
+    label { display: block; margin-bottom: 8px; font-weight: bold; color: #555; }
+    input[type="text"], textarea {
+      width: 100%; padding: 12px; border: 1px solid #dcdfe6;
+      border-radius: 6px; font-size: 16px; box-sizing: border-box;
+    }
+    .upload-options {
+      display: flex; gap: 15px; margin-bottom: 15px;
+    }
+    .upload-option {
+      flex: 1; padding: 10px; text-align: center;
+      border: 1px solid #ccc; border-radius: 8px;
+      cursor: pointer; background: #f2f2f2;
+    }
+    .upload-option.active { border-color: #3498db; background: #e9f5ff; font-weight: bold; }
+    #fileUploadSection { display: none; }
+    .drop-area {
+      padding: 25px; border: 2px dashed #ccc; border-radius: 10px; text-align: center; background: #fafafa;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .drop-area.dragover { background: #e3f2fd; border-color: #3498db; }
+    .response-box {
+      background-color: #ecf0f1; border: 1px solid #dcdfe6;
+      padding: 20px; border-radius: 6px; margin-top: 20px;
+      font-family: 'Courier New', Courier, monospace;
+      white-space: pre-wrap; word-wrap: break-word; min-height: 100px;
+    }
+    button {
+      padding: 12px 25px; background-color: #3498db;
+      color: white; border: none; border-radius: 6px;
+      cursor: pointer; font-size: 16px;
+    }
+    .loader {
+      border: 4px solid #f3f3f3; border-top: 4px solid #3498db;
+      border-radius: 50%; width: 20px; height: 20px;
+      animation: spin 1s linear infinite; margin: auto;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .error-message { color: #e74c3c; font-weight: bold; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>HackRx LLM Document API Client</h1>
+
+  <!-- Upload Option -->
+  <div class="section">
+    <h2>Document Ingestion</h2>
+    <div class="upload-options">
+      <div class="upload-option active" id="selectURL">Add by URL</div>
+      <div class="upload-option" id="selectFile">Upload File</div>
+    </div>
+
+    <!-- URL Ingestion -->
+    <div class="form-group" id="urlUploadSection">
+      <label for="ingestUrl">Document URL:</label>
+      <input type="text" id="ingestUrl" placeholder="e.g., https://example.com/document.pdf">
+    </div>
+
+    <!-- File Upload -->
+    <div class="form-group" id="fileUploadSection">
+      <div id="dropArea" class="drop-area">Drag & Drop your document here or click to select</div>
+      <input type="file" id="fileInput" style="display: none;" />
+    </div>
+
+    <button id="ingestButton">Process Document</button>
+    <div id="ingestStatus" class="response-box" style="display: none;"></div>
+  </div>
+
+  <!-- Query Section -->
+  <div class="section">
+    <h2>Document Query</h2>
+    <div class="form-group">
+      <label for="queryText">Query:</label>
+      <textarea id="queryText" rows="3" placeholder="e.g., 46-year-old male, knee surgery in Pune, 3-month-old policy"></textarea>
+    </div>
+    <button id="queryButton">Get Decision</button>
+    <div id="queryStatus" class="response-box" style="display: none;"></div>
+  </div>
+</div>
+
+<script>
+  const selectURL = document.getElementById('selectURL');
+  const selectFile = document.getElementById('selectFile');
+  const urlSection = document.getElementById('urlUploadSection');
+  const fileSection = document.getElementById('fileUploadSection');
+  const fileInput = document.getElementById('fileInput');
+  const dropArea = document.getElementById('dropArea');
+
+  selectURL.addEventListener('click', () => {
+    selectURL.classList.add('active');
+    selectFile.classList.remove('active');
+    urlSection.style.display = 'block';
+    fileSection.style.display = 'none';
+  });
+
+  selectFile.addEventListener('click', () => {
+    selectFile.classList.add('active');
+    selectURL.classList.remove('active');
+    fileSection.style.display = 'block';
+    urlSection.style.display = 'none';
+  });
+
+  dropArea.addEventListener('click', () => fileInput.click());
+
+  dropArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropArea.classList.add('dragover');
+  });
+
+  dropArea.addEventListener('dragleave', () => {
+    dropArea.classList.remove('dragover');
+  });
+
+  dropArea.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropArea.classList.remove('dragover');
+    fileInput.files = e.dataTransfer.files;
+  });
+
+  const ingestButton = document.getElementById('ingestButton');
+  const ingestStatus = document.getElementById('ingestStatus');
+
+  const showStatus = (el, msg, isErr = false) => {
+    el.style.display = 'block';
+    el.innerHTML = `<div class="${isErr ? 'error-message' : ''}">${msg}</div>`;
+  };
+
+  ingestButton.addEventListener('click', async () => {
+    ingestStatus.style.display = 'block';
+    ingestStatus.innerHTML = `<div class="loader"></div><pre style="text-align:center;">Processing...</pre>`;
+
+    if (selectURL.classList.contains('active')) {
+      const url = document.getElementById('ingestUrl').value.trim();
+      if (!url) return showStatus(ingestStatus, 'Please enter a valid URL.', true);
+      try {
+        const res = await fetch('http://127.0.0.1:5000/process_document', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+        showStatus(ingestStatus, JSON.stringify(data, null, 2), !res.ok);
+      } catch (err) {
+        showStatus(ingestStatus, 'Server error: ' + err.message, true);
+      }
+    } else {
+      const file = fileInput.files[0];
+      if (!file) return showStatus(ingestStatus, 'Please select or drop a file.', true);
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const res = await fetch('http://127.0.0.1:5000/process_document', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        showStatus(ingestStatus, JSON.stringify(data, null, 2), !res.ok);
+      } catch (err) {
+        showStatus(ingestStatus, 'Upload error: ' + err.message, true);
+      }
+    }
+  });
+
+  const queryButton = document.getElementById('queryButton');
+  const queryTextarea = document.getElementById('queryText');
+  const queryStatus = document.getElementById('queryStatus');
+
+  queryButton.addEventListener('click', async () => {
+    const query = queryTextarea.value.trim();
+    if (!query) return showStatus(queryStatus, 'Enter a query.', true);
+
+    queryStatus.style.display = 'block';
+    queryStatus.innerHTML = `<div class="loader"></div><pre style="text-align:center;">Thinking...</pre>`;
+
+    try {
+      const res = await fetch('http://127.0.0.1:5000/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      });
+      const data = await res.json();
+      showStatus(queryStatus, JSON.stringify(data, null, 2), !res.ok);
+    } catch (err) {
+      showStatus(queryStatus, 'Query failed: ' + err.message, true);
+    }
+  });
+</script>
+</body>
+</html>
