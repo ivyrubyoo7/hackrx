@@ -351,11 +351,162 @@ def process_query_api():
         print(f"Error during query processing: {e}")
         return jsonify({"error": f"Failed to process query: {str(e)}"}), 500
 
-@app.route('/api/v1/hackrx/run', methods=['POST'])
+@app.route('/hackrx/run', methods=['POST'])
 def hackrx_run():
-    data = request.get_json()
-    print("Webhook received:", data)  # Log to console
-    return jsonify({"status": "received"}), 200
+    """
+    Unified endpoint that handles:
+    - Document ingestion (via 'url' or 'filepath')
+    - Query processing (via 'query' and 'doc_id')
+    - Both can be handled in a single call if needed
+    """
+    global global_vector_store
 
+    filename = None
+    filepath = None
+    doc_id = None
+
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        response_payload = {}
+
+        # ---------- Document Ingestion Logic ----------
+        if 'url' in data or 'filepath' in data:
+            if 'url' in data:
+                url = data['url']
+                if not url:
+                    return jsonify({"error": "URL cannot be empty"}), 400
+
+                url_path = os.path.basename(url.split('?')[0])
+                filename = f"{uuid.uuid4()}_{secure_filename(url_path)}"
+                if not allowed_file(filename):
+                    return jsonify({"error": f"File type '{filename.rsplit('.', 1)[1]}' from URL is not allowed"}), 400
+
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                response = requests.get(url, stream=True)
+                response.raise_for_status()
+                with open(filepath, 'wb') as temp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        temp_file.write(chunk)
+
+            elif 'filepath' in data:
+                local_path = data['filepath']
+                if not local_path or not os.path.exists(local_path):
+                    return jsonify({"error": "Local filepath does not exist"}), 400
+
+                filename = secure_filename(os.path.basename(local_path))
+                if not allowed_file(filename):
+                    return jsonify({"error": "File type from local path is not allowed"}), 400
+
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                with open(local_path, 'rb') as src_file, open(filepath, 'wb') as dest_file:
+                    dest_file.write(src_file.read())
+
+            file_extension = filename.rsplit('.', 1)[1].lower()
+            doc_content = parse_document(filepath, file_extension)
+            chunks = chunk_document(doc_content)
+
+            doc_id = len(DOCUMENTS_DB) + 1
+            for chunk in chunks:
+                chunk.metadata['source'] = filename
+                chunk.metadata['doc_id'] = doc_id
+
+            if global_vector_store is None:
+                global_vector_store = FAISS.from_documents(chunks, embeddings)
+            else:
+                global_vector_store.add_documents(chunks)
+
+            global_vector_store.save_local(VECTOR_DB_PATH)
+            DOCUMENTS_DB[doc_id] = {'filename': filename, 'content': doc_content, 'filepath': filepath}
+
+            response_payload['document'] = {
+                "document_id": doc_id,
+                "filename": filename,
+                "file_extension": file_extension,
+                "chunk_count": len(chunks),
+                "status": "Ready for querying"
+            }
+
+        # ---------- Query Processing Logic ----------
+        if 'query' in data:
+            query = data['query']
+            doc_id = data.get('doc_id', doc_id)  # use earlier if not provided
+
+            if global_vector_store is None:
+                return jsonify({"error": "No documents uploaded or vector store not initialized."}), 400
+
+            retriever = global_vector_store.as_retriever(search_kwargs={"k": 5})
+
+            decomposition_prompt = PromptTemplate.from_template(
+                "You are a helpful assistant. Your task is to decompose a user's query into a set of multiple, simpler questions that can be answered by searching a document. Respond with a comma-separated list of questions.\n\nQuery: {input}\nDecomposed Questions:"
+            )
+            decomposer_chain = decomposition_prompt | llm | StrOutputParser()
+
+            def retrieve_and_extract_facts(question):
+                docs = retriever.get_relevant_documents(question)
+                docs_str = "\n\n".join([f"From {doc.metadata.get('source', 'Unknown')}:\n{doc.page_content}" for doc in docs])
+
+                retrieval_prompt = ChatPromptTemplate.from_messages([
+                    ("system", """Given the following context from policy documents, extract the fact that answers the user's question. If the answer is not explicitly stated, attempt to infer it cautiously. Avoid saying 'Not found' unless absolutely no info is available.Focus on summarizing relevant policy clauses in 1–2 lines.\n\nQuestion: {question}\nContext:\n{context}\n"""),
+                    ("user", "Extract the fact clearly.")
+                ])
+                chain = retrieval_prompt | llm | StrOutputParser()
+                return chain.invoke({"question": question, "context": docs_str})
+
+            final_synthesis_prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are an expert policy analysis AI. Your task is to make a precise decision based on the user's query and the extracted facts from a document.\n\nQuery: {query}\nExtracted Facts: {extracted_facts}\nRelevant Clauses: {relevant_clauses}\n\nBased on this information, provide a final decision and justification. If information is missing from the facts, state it clearly.\n\nOutput your response as a JSON object strictly following this schema:\n{json_schema}\n"""),
+                ("user", "Query: {query}")
+            ])
+
+            output_parser = JsonOutputParser(pydantic_object=DecisionOutput)
+            json_schema = output_parser.get_format_instructions()
+
+            decomposed_questions_list = decomposer_chain.invoke({"input": query})
+            decomposed_questions = decomposed_questions_list.split(',')
+
+            extracted_facts = [retrieve_and_extract_facts(q.strip()) for q in decomposed_questions]
+
+            relevant_clauses = retriever.get_relevant_documents(query)
+            relevant_clauses_info = []
+            for doc in relevant_clauses:
+                relevant_clauses_info.append({
+                    "source_filename": doc.metadata.get('source', 'Unknown'),
+                    "content_snippet": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                })
+
+            final_input = {
+                "query": query,
+                "extracted_facts": "\n".join([f"- {fact}" for fact in extracted_facts]),
+                "relevant_clauses": "\n\n".join([
+                    f"[Source: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}"
+                    for doc in relevant_clauses
+                ]),
+                "json_schema": json_schema,
+            }
+
+            synthesis_chain = final_synthesis_prompt | llm | output_parser
+            result = synthesis_chain.invoke(final_input)
+
+            parsed_response = DecisionOutput(**result)
+            parsed_response.RelevantClauses = relevant_clauses_info
+            response_payload['query_response'] = parsed_response.dict()
+
+        if not response_payload:
+            return jsonify({"error": "No valid keys provided. Must contain 'url', 'filepath', or 'query'"}), 400
+
+        return jsonify(response_payload), 200
+
+    except requests.exceptions.RequestException as e:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+        return jsonify({"error": f"Error downloading file from URL: {str(e)}"}), 500
+    except Exception as e:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+        print(f"Error during /hackrx/run: {str(e)}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    
 if __name__ == '__main__':
     app.run(debug=True)
